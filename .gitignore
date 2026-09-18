@@ -1,0 +1,4 @@
+repomix-output.xml
+.env
+venv/
+__pycache__/
