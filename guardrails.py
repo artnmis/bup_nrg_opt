@@ -22,20 +22,45 @@ ALLOWED_TYPES = frozenset(
 )
 
 
+def _normalize_dtype(value) -> str:
+    """Fuzzy directive_type match (#8): strip, lowercase, unify separators."""
+    if not isinstance(value, str):
+        return ""
+    t = value.strip().lower().replace("-", "_").replace(" ", "_")
+    # collapse repeats ("solar__reduction" -> "solar_reduction")
+    while "__" in t:
+        t = t.replace("__", "_")
+    return t
+
+
 def _clean_hours(value) -> list | None:
-    """Unique ints 0..23 ascending, or None if unusable."""
+    """Unique ints 0..23 ascending, or None if nothing usable.
+
+    Filter-and-keep (#7): drops out-of-range / non-numeric entries and
+    coerces numeric strings instead of killing the whole directive.
+    """
     if not isinstance(value, list) or not value:
         return None
     cleaned: list = []
     for h in value:
         if isinstance(h, bool):
-            return None
+            continue
         if isinstance(h, float):
             if not h.is_integer():
-                return None
+                continue
             h = int(h)
+        elif isinstance(h, str):
+            s = h.strip()
+            try:
+                # accept "19", "19.0"; reject "19.5", "abc"
+                f = float(s)
+            except Exception:
+                continue
+            if not f.is_integer():
+                continue
+            h = int(f)
         if not isinstance(h, int) or h < 0 or h > 23:
-            return None
+            continue
         if h not in cleaned:
             cleaned.append(h)
     if not cleaned:
@@ -44,10 +69,43 @@ def _clean_hours(value) -> list | None:
 
 
 def _finite_nonneg(value) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            value = float(value)
+        except Exception:
+            return None
+    if not isinstance(value, (int, float)):
         return None
     f = float(value)
     if not math.isfinite(f) or f < 0:
+        return None
+    return f
+
+
+def _to_factor(value) -> float | None:
+    """Coerce solar factor incl. numeric strings; bounds-checked [0,1]."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            value = float(value)
+        except Exception:
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        f = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(f) or not 0 <= f <= 1:
         return None
     return f
 
@@ -90,9 +148,9 @@ def validate_directives(
 def _validate_one(
     index: int, r: RawDirective, battery: Battery
 ) -> DirectiveInterpretation:
-    dtype = r.directive_type if isinstance(r.directive_type, str) else ""
+    dtype = _normalize_dtype(r.directive_type)
     if dtype not in ALLOWED_TYPES:
-        return _to_no_op(index, f"unsupported directive_type {dtype!r}.")
+        return _to_no_op(index, f"unsupported directive_type {r.directive_type!r}.")
 
     adj = r.structured_adjustment
     explanation = r.explanation if isinstance(r.explanation, str) else ""
@@ -115,8 +173,8 @@ def _validate_one(
         return _to_no_op(index, "hours must be unique ints 0..23 ascending.")
 
     if dtype in ("no_charge_window", "no_discharge_window"):
-        if set(adj.keys()) != {"hours"}:
-            return _to_no_op(index, "unexpected keys for window directive.")
+        # Extras-lenient (#4): unknown keys are stripped, required `hours`
+        # stays strict.
         return DirectiveInterpretation(
             note_index=index,
             applies=True,
@@ -126,15 +184,12 @@ def _validate_one(
         )
 
     if dtype == "solar_reduction":
-        if set(adj.keys()) != {"hours", "factor"}:
-            return _to_no_op(index, "solar_reduction needs exactly hours+factor.")
-        factor = adj.get("factor")
-        if (
-            isinstance(factor, bool)
-            or not isinstance(factor, (int, float))
-            or not math.isfinite(float(factor))
-            or not 0 <= float(factor) <= 1
-        ):
+        # Required-keys-strict + extras-lenient: hours + coercible factor
+        # must exist; extras (reason/unit/...) are stripped, not fatal.
+        if "factor" not in adj:
+            return _to_no_op(index, "solar_reduction needs hours+factor.")
+        factor = _to_factor(adj.get("factor"))
+        if factor is None:
             return _to_no_op(index, "factor must be in [0, 1].")
         return DirectiveInterpretation(
             note_index=index,
@@ -145,8 +200,8 @@ def _validate_one(
         )
 
     if dtype == "minimum_battery_reserve":
-        if set(adj.keys()) != {"hours", "minimum_energy_kwh"}:
-            return _to_no_op(index, "reserve needs exactly hours+minimum_energy_kwh.")
+        if "minimum_energy_kwh" not in adj:
+            return _to_no_op(index, "reserve needs hours+minimum_energy_kwh.")
         val = _finite_nonneg(adj.get("minimum_energy_kwh"))
         if val is None or val > float(battery.capacity_kwh):
             return _to_no_op(index, "reserve must be within [0, capacity].")
@@ -159,8 +214,8 @@ def _validate_one(
         )
 
     if dtype == "max_grid_window":
-        if set(adj.keys()) != {"hours", "max_grid_kwh"}:
-            return _to_no_op(index, "grid cap needs exactly hours+max_grid_kwh.")
+        if "max_grid_kwh" not in adj:
+            return _to_no_op(index, "grid cap needs hours+max_grid_kwh.")
         val = _finite_nonneg(adj.get("max_grid_kwh"))
         if val is None:
             return _to_no_op(index, "max_grid_kwh must be finite and >= 0.")

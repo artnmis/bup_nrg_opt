@@ -96,7 +96,7 @@ def _solve_lp(order, D, ES, T, cap, e0, lo, max_ch, max_dis, no_charge, no_disch
     prob += E[23] == e0
     prob += pulp.lpSum(grid[i] * T[i] for i in range(24))
 
-    status = prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=5))
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=3))
     if pulp.LpStatus[status] != "Optimal":
         raise RuntimeError(f"LP not optimal: {pulp.LpStatus[status]}")
 
@@ -128,7 +128,7 @@ def _solve_relaxed(order, D, ES, T, cap, e0, lo, base_min, max_ch, max_dis, no_c
     prob += E[23] == e0
     prob += pulp.lpSum(grid[i] * T[i] for i in range(24)) + pulp.lpSum(slack[h] * big_m for h in slack)
 
-    status = prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=5))
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=3))
     if pulp.LpStatus[status] != "Optimal":
         raise RuntimeError(f"Relaxed LP not optimal: {pulp.LpStatus[status]}")
 

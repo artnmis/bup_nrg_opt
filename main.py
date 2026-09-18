@@ -39,6 +39,9 @@ app = FastAPI(title="GridWise Optimize Energy API", lifespan=lifespan)
 
 # B1: whole LLM+LP pipeline must finish inside the judge's 30s POST budget.
 PIPELINE_TIMEOUT_S = 28.0
+# #1: LLM (initial + capped corrective retry) owns at most 20s; LP owns at
+# most ~6s (2 x 3s CBC caps); ~2s margin for guardrails/overhead.
+LLM_TIMEOUT_S = 20.0
 
 
 @app.get("/health")
@@ -54,12 +57,39 @@ def _run_pipeline(req: OptimizeRequest) -> tuple:
     raw = interpret_notes(
         list(req.operator_notes),
         float(req.battery.capacity_kwh),
+        timeout_s=LLM_TIMEOUT_S,
     )
     directives: List[DirectiveInterpretation] = validate_directives(
         raw, len(req.operator_notes), req.battery
     )
     plan_dicts = optimize(req.hours, req.battery, directives)
     return directives, plan_dicts
+
+
+def _fast_idle_plan(req: OptimizeRequest) -> list:
+    """Solver-free fallback plan (#2): no LP, no I/O, runs in microseconds
+    on the event loop without head-of-line-blocking /health or concurrent
+    samples. All notes are no_op so effective solar == forecast."""
+    hmap = {h.hour: h for h in req.hours}
+    e0 = float(req.battery.initial_energy_kwh)
+    plan = []
+    for h in sorted(hmap.keys()):
+        entry = hmap[h]
+        demand = float(entry.demand_kwh)
+        solar = float(entry.solar_kwh)
+        s = round(min(solar, demand), 4)
+        g = round(demand - s, 4)
+        plan.append(
+            {
+                "hour": h,
+                "grid_kwh": max(g, 0.0),
+                "solar_used_kwh": max(s, 0.0),
+                "battery_action": "idle",
+                "battery_kwh": 0.0,
+                "battery_energy_after_kwh": round(e0, 4),
+            }
+        )
+    return plan
 
 
 @app.post("/optimize-energy", response_model=OptimizeResponse)
@@ -72,6 +102,7 @@ async def optimize_energy(req: OptimizeRequest) -> OptimizeResponse:
         # Controlled degradation: valid idle schedule, all notes no_op.
         # Covers LLM failure, LP failure, AND pipeline timeout.
         # Never a crash, never a stack trace (rules.md §5/§7).
+        # #2: solver-free idle — never blocks the event loop with CBC.
         directives = [
             DirectiveInterpretation(
                 note_index=i,
@@ -82,11 +113,25 @@ async def optimize_energy(req: OptimizeRequest) -> OptimizeResponse:
             )
             for i in range(len(req.operator_notes))
         ]
-        plan_dicts = optimize(req.hours, req.battery, directives)
+        plan_dicts = _fast_idle_plan(req)
 
     hours_sorted = sorted(req.hours, key=lambda h: h.hour)
     tariff = {h.hour: h.tariff_bdt_per_kwh for h in hours_sorted}
-    hourly_plan = [HourlyPlanEntry(**p) for p in plan_dicts]
+    try:
+        hourly_plan = [HourlyPlanEntry(**p) for p in plan_dicts]
+    except Exception:
+        # Response-side guard (#12): never emit a malformed plan.
+        plan_dicts = _fast_idle_plan(req)
+        hourly_plan = [HourlyPlanEntry(**p) for p in plan_dicts]
+    # Response self-check (#12): 24 entries, non-negative, totals agree
+    # (totals are recomputed below, so agreement is by construction; the
+    # checks below guard against negative/solver-dust regressions).
+    if len(hourly_plan) != 24 or sorted(p.hour for p in hourly_plan) != list(range(24)):
+        plan_dicts = _fast_idle_plan(req)
+        hourly_plan = [HourlyPlanEntry(**p) for p in plan_dicts]
+    elif any(p.grid_kwh < -0.011 or p.solar_used_kwh < -0.011 or p.battery_kwh < -0.011 for p in hourly_plan):
+        plan_dicts = _fast_idle_plan(req)
+        hourly_plan = [HourlyPlanEntry(**p) for p in plan_dicts]
 
     total_grid = round(sum(p.grid_kwh for p in hourly_plan), 4)
     total_cost = round(sum(p.grid_kwh * tariff[p.hour] for p in hourly_plan), 4)

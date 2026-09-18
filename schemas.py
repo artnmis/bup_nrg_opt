@@ -30,6 +30,25 @@ class Battery(BaseModel):
     max_charge_kwh_per_hour: float = Field(ge=0)
     max_discharge_kwh_per_hour: float = Field(ge=0)
 
+    @model_validator(mode="after")
+    def _clamp_to_capacity(self) -> "Battery":
+        """Cross-field guard (#12): initial/minimum above capacity would make
+        every LP solve infeasible (wasting the 2x3s CBC budget). Clamp into
+        [0, capacity] so the optimizer always gets a feasible box; the
+        directive reserves still apply on top."""
+        try:
+            cap = float(self.capacity_kwh)
+        except Exception:
+            return self
+        try:
+            if float(self.initial_energy_kwh) > cap:
+                self.initial_energy_kwh = cap
+            if float(self.minimum_energy_kwh) > cap:
+                self.minimum_energy_kwh = cap
+        except Exception:
+            pass
+        return self
+
 
 class OptimizeRequest(BaseModel):
     scenario_id: str = Field(min_length=1)

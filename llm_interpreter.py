@@ -24,12 +24,39 @@ _logging.getLogger("google.genai").setLevel(_logging.ERROR)
 
 # Cache: (note text stripped, battery capacity) -> RawDirective.
 # Helps p95 latency when the judge repeats similar notes.
+# Bounded LRU (#10): max 2000 entries, eviction of least-recently-used.
+# Per-process (workers=2 each have their own); bound keeps memory flat.
 _CACHE: dict = {}
+_CACHE_MAX = 2000
 
-# Cooldown per API key after 429/503: monotonic timestamp until which the
-# key is skipped. Preserves split-budget per_key_timeout (fewer keys tried
-# => larger share each). In-memory only; safe across workers per-process.
+
+def _cache_get(key):
+    try:
+        val = _CACHE.get(key)
+        if val is not None:
+            # refresh recency
+            del _CACHE[key]
+            _CACHE[key] = val
+        return val
+    except Exception:
+        return None
+
+
+def _cache_put(key, val) -> None:
+    try:
+        if key in _CACHE:
+            del _CACHE[key]
+        _CACHE[key] = val
+        while len(_CACHE) > _CACHE_MAX:
+            _CACHE.pop(next(iter(_CACHE)))
+    except Exception:
+        pass
+
+# Cooldown per API key after quota/overload: monotonic timestamp until which
+# the key is skipped. Exponential backoff per key (#13); auth errors
+# quarantine the key long-term. In-memory only, per-process.
 _KEY_COOLDOWN_UNTIL: dict = {}
+_KEY_FAIL_COUNT: dict = {}
 
 # Round-robin pool cursor: each _call_gemini invocation starts at the next
 # key, so CONCURRENT requests spread across keys from the first attempt
@@ -53,11 +80,26 @@ def _next_pool_start(n: int) -> int:
 # {} (verified live: solar_reduction with empty adjustment), which
 # guardrails must reject. Prompt few-shots + guardrails constrain shape.
 
-# Energy keywords: a no_op on a note containing one of these is suspicious
-# and eligible for ONE corrective retry (A3). Distractors have none of these.
-_ENERGY_KEYWORDS = (
-    "solar", "pv", "panel", "battery", "charge", "discharge", "grid",
-    "reserve", "kwh", "tariff", "hour", "pm", "am", ":00",
+# Energy-equipment keywords (#6): word-boundary matched so the canonical
+# distractor ("library … book-return hours") and substrings ("campus"/"team"
+# containing "am", "hours" containing "hour") do NOT trigger a wasted
+# corrective retry. Pure time markers (hour/am/pm/:00) are deliberately
+# excluded — retry fires on equipment language, not clock language.
+# Synonyms added: photovoltaic, rooftop, kw (bare unit), charger, inverter,
+# feeder, substation.
+_ENERGY_PATTERNS = (
+    r"solar", r"photovoltaic", r"\bpv\b", r"panel", r"rooftop",
+    r"battery", r"charg\w*", r"discharg\w*", r"\bgrid\b",
+    r"reserve", r"\bkwh?\b", r"tariff", r"inverter", r"feeder",
+    r"substation",
+)
+_ENERGY_RE = re.compile("|".join(f"(?:{p})" for p in _ENERGY_PATTERNS), re.IGNORECASE)
+
+# Distractor nouns that suppress the retry when no equipment word is present
+# (belt-and-braces; _has_energy_keyword already returns False for them).
+_DISTRACTOR_RE = re.compile(
+    r"cafeteria|library|menu|deadline|club|booking|seminar|registration",
+    re.IGNORECASE,
 )
 
 SYSTEM_PROMPT = """You interpret campus operator notes into energy directives.
@@ -124,6 +166,20 @@ Note: "The library is extending book-return hours next week."
 -> {"note_index":0,"applies":false,"directive_type":"no_op","structured_adjustment":null,"explanation":"Irrelevant to energy schedule."}
 """
 
+# Slim corrective-retry prompt (#11): the model already saw full context on
+# the first call, so the 1-note retry sends rules + 2 shots only (~85% fewer
+# tokens than re-sending all 16 few-shots).
+RETRY_SYSTEM_PROMPT = """You interpret campus operator notes into energy directives.
+Return ONLY valid JSON, no prose, no markdown fences.
+Allowed directive_type: solar_reduction {"hours":[...],"factor":REMAINING fraction}, minimum_battery_reserve {"hours":[...],"minimum_energy_kwh":absolute kWh}, no_charge_window/no_discharge_window {"hours":[...]}, max_grid_window {"hours":[...],"max_grid_kwh":kWh}, no_op null.
+Rules: hours are start-inclusive end-exclusive ints 0..23 ascending ("1-3PM"->[13,14]; "6-9PM"->[18,19,20]); solar factor is REMAINING ("80% reduction"->0.2; "drop to 20%"->0.2); reserve is absolute kWh (50% of 200kWh->100); no energy equipment => no_op. Exact keys only, no extras.
+Examples:
+Note: "Expect an 80% reduction in rooftop solar during the 1-3 PM maintenance window."
+-> {"note_index":0,"applies":true,"directive_type":"solar_reduction","structured_adjustment":{"hours":[13,14],"factor":0.2},"explanation":"Solar 80pct reduction leaves 0.2."}
+Note: "Do not charge the battery between 2 PM and 4 PM."
+-> {"note_index":0,"applies":true,"directive_type":"no_charge_window","structured_adjustment":{"hours":[14,15]},"explanation":"Charging unavailable 14-15."}
+"""
+
 
 def _safe_default(index: int) -> RawDirective:
     return RawDirective(
@@ -168,8 +224,7 @@ def _parse_json(text: str):
 
 
 def _has_energy_keyword(note: str) -> bool:
-    low = note.lower()
-    return any(k in low for k in _ENERGY_KEYWORDS)
+    return bool(_ENERGY_RE.search(note or ""))
 
 
 def _suspicious_no_ops(
@@ -197,6 +252,77 @@ def _suspicious_no_ops(
     for pos, (note, v) in enumerate(zip(batch_notes, _checked)):
         if v.directive_type == "no_op" and _has_energy_keyword(note):
             out.append(pos)
+    return out
+
+
+def _mentions_solar(note: str) -> bool:
+    return bool(re.search(r"solar|photovoltaic|\bpv\b|panel|rooftop", note or "", re.IGNORECASE))
+
+
+def _suspicious_mismatches(
+    batch_notes: List[str], fresh: List["RawDirective"]
+) -> List[int]:
+    """Wrong-but-valid outputs (#5): confident mis-types that validate yet
+    contradict the note text. Returns batch positions to retry."""
+    out: List[int] = []
+    for pos, (note, r) in enumerate(zip(batch_notes, fresh)):
+        try:
+            dtype = (r.directive_type or "").strip().lower()
+        except Exception:
+            continue
+        if dtype == "no_op":
+            continue  # handled by _suspicious_no_ops
+        low = (note or "").lower()
+        no_dis = bool(re.search(
+            r"must not discharge|do not discharge|not discharge|"
+            r"discharge\s+(is\s+)?(isolated|unavailable|disabled)|"
+            r"discharge.*(unavailable|disabled|isolated)", low))
+        no_ch = bool(re.search(
+            r"do not charge|not charge|charging\s+(disabled|unavailable)|"
+            r"charger.*isolated|charging circuit.*unavailable|"
+            r"charging?\s+(is\s+)?(isolated|unavailable|disabled)", low))
+        # Charge/discharge swap: note forbids one, model picked the other.
+        if no_dis and dtype == "no_charge_window":
+            out.append(pos)
+            continue
+        if no_ch and dtype == "no_discharge_window":
+            out.append(pos)
+            continue
+        # Solar note typed as a non-solar directive.
+        if _mentions_solar(note) and dtype in (
+            "no_charge_window", "no_discharge_window",
+            "max_grid_window", "minimum_battery_reserve",
+        ):
+            out.append(pos)
+            continue
+        # Grid-cap note typed as something else entirely.
+        if "grid" in low and re.search(r"exceed|below|cap|limit|155|190|kwh", low) \
+                and dtype in ("no_charge_window", "no_discharge_window",
+                              "solar_reduction", "minimum_battery_reserve"):
+            out.append(pos)
+            continue
+        # Reserve note typed as a window/cap/solar directive.
+        if re.search(r"reserve|keep at least|minimum.*energy|%.*capacity", low) \
+                and "battery" in low \
+                and dtype in ("no_charge_window", "no_discharge_window",
+                              "solar_reduction", "max_grid_window"):
+            out.append(pos)
+            continue
+        # Factor polarity sanity: "80% reduction" must leave ~0.2, not 0.8.
+        try:
+            adj = r.structured_adjustment or {}
+            if dtype == "solar_reduction" and isinstance(adj, dict) and "factor" in adj:
+                f = float(adj["factor"])
+                m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*reduct", low)
+                if m and abs(f - float(m.group(1)) / 100.0) < 0.02:
+                    out.append(pos)  # emitted reduction instead of remainder
+                    continue
+                m2 = re.search(r"drop to (?:about\s+)?(\d+(?:\.\d+)?)\s*%", low)
+                if m2 and abs(f - (1.0 - float(m2.group(1)) / 100.0)) < 0.02:
+                    out.append(pos)  # inverted drop-to
+                    continue
+        except Exception:
+            pass
     return out
 
 
@@ -253,8 +379,15 @@ def _extract_hours(text: str) -> list | None:
     m = re.search(r"(\d{1,2}):00\s*(?:-|–|until|to|and)\s*(\d{1,2}):00", low)
     if m:
         s, e = int(m.group(1)) % 24, int(m.group(2)) % 24
-        if 0 <= s < 24 and 0 < e <= 24 and e > s:
-            return list(range(s, e))
+        if 0 <= s < 24 and 0 <= e < 24 and s != e:
+            if e > s:
+                if e <= 24:
+                    return list(range(s, e))
+            else:
+                # Midnight-crossing (#9): "22:00-02:00" -> [0,1,22,23].
+                if (24 - s + e) <= 12:
+                    return sorted(list(range(s, 24)) + list(range(0, e)))
+            return None
         return None
     # "1-3PM" / "1 PM to 3 PM" / "2 AM until 5 AM" / "between 2 and 4 PM",
     # incl. word numbers.
@@ -283,12 +416,24 @@ def _extract_hours(text: str) -> list | None:
         # Propagate a single marker: "1-3 PM" => both PM; bare solar
         # "one until three" with solar/panel/pv => daytime (PM).
         shared = s_ap or e_ap
-        if shared is None and any(w in low for w in ("solar", "pv", "panel")):
+        if shared is None and _mentions_solar(low):
             shared = "pm"
-        s = _ampm_to_24(s_n, s_ap, shared)
-        e = _ampm_to_24(e_n, e_ap, shared)
-        if 0 <= s < 24 and 0 < e <= 24 and e > s and (e - s) <= 12:
-            return list(range(s, e))
+        # noon/midday always maps to 12, not 0 (avoid AM→0 conversion)
+        if s_raw in ("noon", "midday"):
+            s = 12
+        else:
+            s = _ampm_to_24(s_n, s_ap, shared)
+        if e_raw in ("noon", "midday"):
+            e = 12
+        else:
+            e = _ampm_to_24(e_n, e_ap, shared)
+        if 0 <= s < 24 and 0 <= e < 24 and s != e:
+            span = (e - s) % 24
+            if 0 < span <= 12:
+                if e > s:
+                    return list(range(s, e))
+                # Midnight-crossing (#9): "10 PM to 2 AM" -> [0,1,22,23].
+                return sorted(list(range(s, 24)) + list(range(0, e)))
     return None
 
 
@@ -315,29 +460,45 @@ def _regex_fallback(note: str, capacity: float, index: int) -> "RawDirective | N
         if not _has_energy_keyword(note):
             return _mk("no_op", None, False, "distractor note; no energy equipment.")
     if hours:
-        if re.search(r"do not charge|charging (disabled|unavailable)|charger.*isolated|charging circuit.*unavailable", low):
+        if re.search(r"do not charge|not charge|charging (disabled|unavailable)|charger.*isolated|charging circuit.*unavailable", low):
             return _mk("no_charge_window", {"hours": hours}, True, f"charging unavailable {hours}.")
         if re.search(r"must not discharge|do not discharge|discharge isolated|not discharge", low):
             return _mk("no_discharge_window", {"hours": hours}, True, f"discharging unavailable {hours}.")
-        # Solar: percent patterns -> REMAINING factor.
-        m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*reduction", low)
-        if m and any(w in low for w in ("solar", "pv", "panel")):
+        # Solar: percent patterns -> REMAINING factor (#9: generalized).
+        is_solar = _mentions_solar(note)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*reduct\w*", low)
+        if m and is_solar:
             return _mk("solar_reduction", {"hours": hours, "factor": round(1.0 - float(m.group(1)) / 100.0, 4)}, True, "percent reduction to remaining.")
-        m = re.search(r"drop to (?:about\s+)?(\d+(?:\.\d+)?)\s*%", low)
-        if m and any(w in low for w in ("solar", "pv", "panel")):
+        m = re.search(r"reduc\w*\s+by\s*(?:about\s+)?(\d+(?:\.\d+)?)\s*%", low)
+        if m and is_solar:
+            return _mk("solar_reduction", {"hours": hours, "factor": round(1.0 - float(m.group(1)) / 100.0, 4)}, True, "reduced-by percent to remaining.")
+        m = re.search(r"drop to (?:about\s+|roughly\s+|around\s+)?(\d+(?:\.\d+)?)\s*%", low)
+        if m and is_solar:
             return _mk("solar_reduction", {"hours": hours, "factor": round(float(m.group(1)) / 100.0, 4)}, True, "drop-to percent remaining.")
-        if any(w in low for w in ("solar", "pv", "panel")):
+        m = re.search(r"cut to (?:about\s+|roughly\s+)?(\d+(?:\.\d+)?)\s*%", low)
+        if m and is_solar:
+            return _mk("solar_reduction", {"hours": hours, "factor": round(float(m.group(1)) / 100.0, 4)}, True, "cut-to percent remaining.")
+        m = re.search(r"cut by (?:about\s+)?(\d+(?:\.\d+)?)\s*%", low)
+        if m and is_solar:
+            return _mk("solar_reduction", {"hours": hours, "factor": round(1.0 - float(m.group(1)) / 100.0, 4)}, True, "cut-by percent to remaining.")
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*of\s*forecast", low)
+        if m and is_solar:
+            return _mk("solar_reduction", {"hours": hours, "factor": round(float(m.group(1)) / 100.0, 4)}, True, "percent-of-forecast remaining.")
+        if is_solar:
             if "one-fifth" in low or "one fifth" in low or "20%" in low:
                 return _mk("solar_reduction", {"hours": hours, "factor": 0.2}, True, "one-fifth remaining.")
             if "half" in low or "50%" in low:
                 return _mk("solar_reduction", {"hours": hours, "factor": 0.5}, True, "half remaining.")
             if "25%" in low or "quarter" in low:
                 return _mk("solar_reduction", {"hours": hours, "factor": 0.25}, True, "quarter remaining.")
-        m = re.search(r"(?:must not exceed|at or below|stay at or below|capped? at|limit (?:is|of))\s*(\d+(?:\.\d+)?)\s*kwh", low)
+        m = re.search(r"(?:must not exceed|not exceed|at or below|stay at or below|capped? at|limit (?:is|of)|requires? at least|max(?:imum)?(?: of)?)\s*(\d+(?:\.\d+)?)\s*kwh", low)
         if m and "grid" in low:
             return _mk("max_grid_window", {"hours": hours, "max_grid_kwh": float(m.group(1))}, True, "grid cap kWh.")
-        m = re.search(r"keep at least\s*(\d+(?:\.\d+)?)\s*kwh", low)
-        if m and ("reserve" in low or "battery" in low):
+        # Reserve kWh (#9): "requires at least 80 kWh", "minimum of X", etc.
+        m = re.search(r"(?:keep|maintain|requires?|required|ensure|hold|store|retain)[^.]{0,40}?(?:at least|minimum(?: of)?|no less than)\s*(\d+(?:\.\d+)?)\s*kwh", low)
+        if not m:
+            m = re.search(r"(?:at least|minimum(?: of)?|no less than)\s*(\d+(?:\.\d+)?)\s*kwh", low)
+        if m and ("reserve" in low or "battery" in low or "keep" in low or "require" in low):
             return _mk("minimum_battery_reserve", {"hours": hours, "minimum_energy_kwh": float(m.group(1))}, True, "reserve kWh.")
         m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*of[^.]*capacity", low)
         if m and ("reserve" in low or "battery" in low or "keep" in low):
@@ -349,16 +510,24 @@ def _regex_fallback(note: str, capacity: float, index: int) -> "RawDirective | N
 
 
 def interpret_notes(
-    notes: List[str], battery_capacity_kwh: float, timeout_s: float = 15.0
+    notes: List[str], battery_capacity_kwh: float, timeout_s: float = 20.0
 ) -> List[RawDirective]:
-    """Return one RawDirective per note, in order. Never raises."""
-    # Serve cache hits without an API call.
+    """Return one RawDirective per note, in order. Never raises.
+
+    Budget (#1/#2): the whole call (initial + ONE capped corrective retry)
+    fits inside timeout_s. Retry fires only when >=1 note is salvageable
+    AND >=4s remain; it is capped at min(5s, remaining).
+    """
+    import time as _t
+
+    _t0 = _t.monotonic()
+    # Serve cache hits without an API call (bounded LRU, #10).
     uncached_idx: List[int] = []
     results: List[RawDirective | None] = [None] * len(notes)
     for i, note in enumerate(notes):
         key = (note.strip(), round(float(battery_capacity_kwh), 4))
-        if key in _CACHE:
-            cached = _CACHE[key]
+        cached = _cache_get(key)
+        if cached is not None:
             results[i] = RawDirective(
                 note_index=i,
                 applies=cached.applies,
@@ -385,28 +554,34 @@ def interpret_notes(
         for slot, raw in zip(uncached_idx, fresh):
             raw.note_index = slot  # enforce position, ignore model numbering
             results[slot] = raw
-            _CACHE[(notes[slot].strip(), round(float(battery_capacity_kwh), 4))] = raw
+            _cache_put((notes[slot].strip(), round(float(battery_capacity_kwh), 4)), raw)
 
-        # A3: ONE corrective retry only. Dry-run guardrails on the fresh
-        # batch; a no_op on a note WITH energy keywords is suspicious
-        # (salvage, don't accept). No retry on clean no_op or valid output.
+        # A3: ONE corrective retry only, capped by remaining budget (#1/#2).
+        # Triggers: validated no_op on energy-equipment notes (#6) PLUS
+        # wrong-but-valid mis-types (#5). Slim retry prompt (#11).
         try:
-            _suspicious = _suspicious_no_ops(
-                [notes[i] for i in uncached_idx], fresh, battery_capacity_kwh
-            )
+            _batch = [notes[i] for i in uncached_idx]
+            _s_noop = _suspicious_no_ops(_batch, fresh, battery_capacity_kwh)
         except Exception:
-            _suspicious = []
-        if _suspicious:
+            _s_noop = []
+        try:
+            _s_mm = _suspicious_mismatches(_batch, fresh)
+        except Exception:
+            _s_mm = []
+        _suspicious = sorted(set(_s_noop) | set(_s_mm))
+        _elapsed = _t.monotonic() - _t0
+        _remaining = float(timeout_s) - _elapsed
+        if _suspicious and _remaining >= 4.0:
             try:
-                _retry_notes = [[notes[i] for i in uncached_idx][j] for j in _suspicious]
-                _reasons = _suspicious_reasons(
-                    [notes[i] for i in uncached_idx], fresh, _suspicious
-                )
+                _retry_notes = [_batch[j] for j in _suspicious]
+                _reasons = _suspicious_reasons(_batch, fresh, _suspicious)
+                _retry_budget = min(5.0, _remaining - 0.5)
                 _corrected = _call_gemini(
                     _retry_notes,
                     battery_capacity_kwh,
-                    10.0,  # API floor: sub-10s deadlines are rejected outright
+                    _retry_budget,
                     _corrective_suffix(_reasons),
+                    system_prompt=RETRY_SYSTEM_PROMPT,
                 )
                 for pos, raw in zip(_suspicious, _corrected):
                     slot = uncached_idx[pos]
@@ -415,7 +590,7 @@ def interpret_notes(
                     # a second no_op means the note really is irrelevant.
                     if raw.directive_type != "no_op" or raw.applies:
                         results[slot] = raw
-                        _CACHE[(notes[slot].strip(), round(float(battery_capacity_kwh), 4))] = raw
+                        _cache_put((notes[slot].strip(), round(float(battery_capacity_kwh), 4)), raw)
             except Exception:
                 try:
                     import sys as _sys2
@@ -445,11 +620,50 @@ def interpret_notes(
     return [r for r in results if r is not None]  # type: ignore[misc]
 
 
+def _note_key_success(api_key: str) -> None:
+    """Clear backoff state after a working key (#13)."""
+    try:
+        _KEY_FAIL_COUNT.pop(api_key, None)
+    except Exception:
+        pass
+
+
+def _note_key_failure(api_key: str, exc: BaseException) -> None:
+    """Class-first cooldown (#13): auth errors quarantine the key; quota /
+    overload backs off exponentially; nothing else cools down (avoids the
+    old substring overmatch on 'limit'/'retry')."""
+    import time as _time
+
+    try:
+        cname = type(exc).__name__
+        msg = f"{cname} {exc}".lower()
+    except Exception:
+        return
+    try:
+        # Auth / bad-key: quarantine long-term (dead keys never retried soon).
+        if cname in ("Unauthenticated", "PermissionDenied", "Unauthorized") or \
+                any(s in msg for s in ("401", "403", "invalid api key", "api key not valid", "permission denied", "unauthenticated")):
+            _KEY_COOLDOWN_UNTIL[api_key] = _time.monotonic() + 1800.0
+            return
+        # Quota / overload / transient: exponential backoff 60s,120s,...≤300s.
+        if cname in ("ResourceExhausted", "ServiceUnavailable", "Unavailable",
+                     "DeadlineExceeded", "Internal", "Unknown") or \
+                any(s in msg for s in ("429", "503", "504", "quota", "exhausted",
+                                       "overload", "overloaded", "rate", "unavailable",
+                                       "timeout", "timed out", "connection", "reset", "eof")):
+            n = int(_KEY_FAIL_COUNT.get(api_key, 0)) + 1
+            _KEY_FAIL_COUNT[api_key] = n
+            _KEY_COOLDOWN_UNTIL[api_key] = _time.monotonic() + min(300.0, 60.0 * (2 ** (n - 1)))
+    except Exception:
+        pass
+
+
 def _call_gemini(
     notes: List[str],
     battery_capacity_kwh: float,
     timeout_s: float,
     extra_suffix: str = "",
+    system_prompt: str | None = None,
 ) -> List[RawDirective]:
     """ONE batched call with key pool + failover.
 
@@ -459,7 +673,8 @@ def _call_gemini(
     failure (429 quota, 503 overload, 401/403 bad key, timeout, connection
     reset, empty response, bad JSON). First success wins; no retry on valid
     JSON. Raises only if ALL keys fail — caller degrades to safe defaults.
-    extra_suffix appends corrective context for the 1x A3 retry.
+    extra_suffix appends corrective context for the 1x A3 retry, which uses
+    the slim RETRY_SYSTEM_PROMPT (#11) instead of the full 16-shot prompt.
     """
     # Lazy import: keeps GET /health alive even if keys are misconfigured.
     try:
@@ -476,8 +691,9 @@ def _call_gemini(
         raise RuntimeError("Gemini key missing")
 
     numbered = "\n".join(f"Note {i}: {n}" for i, n in enumerate(notes))
+    _sys_prompt = system_prompt or SYSTEM_PROMPT
     prompt = (
-        SYSTEM_PROMPT
+        _sys_prompt
         + f"\nBattery capacity: {battery_capacity_kwh} kWh "
         + "(use ONLY to convert percentage reserves to kWh).\n"
         + f"Interpret these {len(notes)} note(s); return a JSON array with "
@@ -486,27 +702,34 @@ def _call_gemini(
         + (extra_suffix or "")
     )
 
-    # Split the total budget across keys so 3-key worst case ~= timeout_s,
-    # keeping POST <30s end-to-end. Floor is 10s: the Gemini API rejects
-    # manually-set deadlines below 10s with 400 INVALID_ARGUMENT.
-    # A5: skip keys in 429/503 cooldown (60s); if all are cooling, use the
-    # one whose cooldown expires soonest instead of failing outright.
+    # Split the total budget across keys so N-key worst case ~= timeout_s
+    # (#1): per-key share with a small 2s floor (client-side HTTP timeout —
+    # sub-10s values are fine; the old 10s floor tripled worst-case spend).
+    # An overall deadline is enforced across failovers so orphans die fast
+    # (#3). Skip keys in cooldown; if all are cooling, use the one whose
+    # cooldown expires soonest instead of failing outright.
     import time as _time
 
     _now = _time.monotonic()
+    _deadline = _now + max(0.5, float(timeout_s))
     _healthy = [k for k in keys if _KEY_COOLDOWN_UNTIL.get(k, 0.0) <= _now]
     if not _healthy:
         _healthy = sorted(keys, key=lambda k: _KEY_COOLDOWN_UNTIL.get(k, 0.0))[:1]
     # Round-robin start: concurrent invocations fan out across the pool.
     _start = _next_pool_start(len(_healthy))
     _healthy = _healthy[_start:] + _healthy[:_start]
-    per_key_timeout = max(10.0, float(timeout_s) / max(1, len(_healthy)))
+    per_key_share = float(timeout_s) / max(1, len(_healthy))
     last_err: Exception = RuntimeError("all Gemini keys failed")
     for ki, api_key in enumerate(_healthy):
+        _remaining = _deadline - _time.monotonic()
+        if _remaining <= 0.5:
+            break
+        attempt_timeout = max(2.0, min(per_key_share, _remaining))
         try:
             out = _call_gemini_with_key(
-                prompt, notes, model, api_key, per_key_timeout
+                prompt, notes, model, api_key, attempt_timeout
             )
+            _note_key_success(api_key)
             return out
         except Exception as e:
             last_err = e
@@ -521,16 +744,7 @@ def _call_gemini(
                 )
             except Exception:
                 pass
-            # A5: 429/503 => cool this key down 60s so bursts rotate away.
-            try:
-                _msg = f"{type(e).__name__} {e}".lower()
-                if any(
-                    s in _msg
-                    for s in ("429", "503", "quota", "overload", "rate", "limit", "retry")
-                ):
-                    _KEY_COOLDOWN_UNTIL[api_key] = _time.monotonic() + 60.0
-            except Exception:
-                pass
+            _note_key_failure(api_key, e)
             continue
     raise last_err
 
